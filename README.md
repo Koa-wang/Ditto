@@ -22,6 +22,26 @@ cargo run --release  # 日常使用
 需要 Rust 2021（实测 1.97）。macOS 与 Linux（X11 / Wayland）均可，Linux 会自动启用
 `wayland-data-control`。
 
+## 装成命令（不想每次打 `cargo run`）
+
+```bash
+cargo install --path .   # 或简写：cargo inst
+```
+
+> `cargo install` 从 cargo 1.97 起**默认就是 release 构建**，不再接受 `--release` 参数
+> （传了会报 `unexpected argument '--release'`）；需要 debug 构建时改用 `--debug`。
+
+装完后在**任意目录**敲 `dtto` 即可；改完代码要重新执行一次上面的命令覆盖安装。
+
+> **为什么命令叫 `dtto` 而不是 `ditto`**：macOS 自带 `/usr/bin/ditto`（文件拷贝工具）。
+> 装成 `ditto` 会二选一出问题：
+> - `cargo install` 装到 `~/.cargo/bin`，若它排在 `/usr/bin` **之后**（本机就是：PATH 位置 21 vs 12），
+>   敲 `ditto` 实际跑的是**系统工具**，不是这个 TUI；
+> - 若排在前（Homebrew 的 `/opt/homebrew/bin` 在本机排第 8），则会**盖掉系统命令**，
+>   以后任何脚本调 `ditto` 都会调到这个 TUI。
+>
+> 所以二进制名用 `dtto`，而 crate 名 / 产品名 / 数据目录仍是 `ditto`。
+
 ## 快捷键
 
 | 键 | 行为 |
@@ -57,6 +77,8 @@ cargo run --release  # 日常使用
 ## 结构
 
 ```
+Cargo.toml
+.cargo/config.toml   cargo 别名（cargo inst）
 src/main.rs       入口、事件循环、TerminalGuard(RAII)、panic hook
 src/app.rs        应用状态机与按键分发（纯逻辑，可单测）
 src/clipboard.rs  监听线程、AppEvent/MonitorCmd 通道协议

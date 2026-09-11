@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "终端剪贴板历史管理器（Ratatui TUI）"
 
+# 二进制名刻意不叫 ditto：macOS 自带 /usr/bin/ditto（文件拷贝工具）。
+# 装成 ditto 会二选一出问题——要么被系统命令挡在前面（敲 ditto 实际跑的是系统工具），
+# 要么把系统命令盖掉（Homebrew 的 bin 目录排在 /usr/bin 之前）。
+# crate 名仍是 ditto（项目身份与数据目录 ~/Library/Application Support/ditto/ 不变）。
+[[bin]]
+name = "dtto"
+path = "src/main.rs"
+
 [dependencies]
 arboard = "3.6.1"
 crossterm = "0.29.0"

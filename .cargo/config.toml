@@ -1,0 +1,8 @@
+# 项目级 cargo 别名（会随仓库分发，属于开发便利，不是个人偏好设置）
+
+[alias]
+# 改完代码后一条命令重装：cargo inst
+# 等价于 cargo install --path .（cargo 1.97 起 install 默认就是 release 构建，
+# 不再接受 --release 参数，传了会报 "unexpected argument '--release'"）
+# 装完即可在任意目录敲 dtto
+inst = "install --path ."
