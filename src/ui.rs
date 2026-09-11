@@ -19,6 +19,9 @@ pub const MAX_PREVIEW_WIDTH: usize = 40;
 /// 选中项前缀。它的宽度必须从可用行宽里扣掉，否则右侧数字会错位。
 const HIGHLIGHT_SYMBOL: &str = "▸ ";
 
+/// 正文至少要留出的列数。空间不够时，它是最后被牺牲的东西。
+const MIN_PREVIEW_WIDTH: usize = 4;
+
 /// 预览与右侧字数之间保留的最小空隙。
 const MIN_GAP: usize = 2;
 
@@ -174,7 +177,11 @@ pub fn fold_whitespace(text: &str) -> String {
 }
 
 /// 按**显示宽度**截断，超出时补 `...`。恰好等宽不截断、不补省略号。
-pub fn truncate_preview(text: &str, max_width: usize) -> String {
+///
+/// 逐字符累加 `UnicodeWidthChar::width`（CJK 全角算 2 列），因此：
+/// - 不会把一个宽字符切成半截；
+/// - 永远不会在多字节字符中间切片。直接写 `&s[..n]` 会在中文上 panic。
+pub fn truncate_to_width(text: &str, max_width: usize) -> String {
     let folded = fold_whitespace(text);
     if display_width(&folded) <= max_width {
         return folded;
@@ -201,20 +208,44 @@ pub fn truncate_preview(text: &str, max_width: usize) -> String {
 
 /// 拼出一行的片段：`(序号前缀, 预览, 填充空格数, 右侧字数)`。
 ///
-/// 抽出来是为了能断言「整行宽度刚好等于可用宽度」——右侧字数靠对齐全靠这里的
-/// 空格数算得准，靠肉眼在终端里很难发现差了一两列。
+/// 优先级是 **正文 > 序号 > 字数**，空间不足时逐级降级：
+/// 1. `序号 + 正文 + 空隙 + 字数`（常规形态）；
+/// 2. 放不下就先丢掉字数统计——三者里它最不重要，正文才是这个列表的意义；
+/// 3. 再放不下就只留正文。
+///
+/// 这个阶梯是必需的：ratatui 对超宽行是从右侧**静默裁掉**的（不会自己补省略号），
+/// 所以只要拼出来的行超过 `row_width`，行尾的字数统计就会连同省略号一起消失；
+/// 而如果把字数当成不可让步的固定宽度，窄终端下正文会被挤成空字符串，
+/// 只剩下一行「序号 + (N 字)」。
+///
+/// 返回值保证：前缀宽度 + 预览宽度 + pad + 字数宽度 <= row_width。
 pub fn row_parts(index: usize, text: &str, row_width: usize) -> (String, String, usize, String) {
     let prefix = format!("{:>3} ", index + 1);
-    let suffix = format!("({} 字)", text.chars().count());
+    let count = format!("({} 字)", text.chars().count());
 
-    let reserved = display_width(&prefix) + display_width(&suffix) + MIN_GAP;
-    let budget = row_width.saturating_sub(reserved).min(MAX_PREVIEW_WIDTH);
-    let preview = truncate_preview(text, budget);
+    let prefix_width = display_width(&prefix);
+    let count_width = display_width(&count);
 
-    let used = display_width(&prefix) + display_width(&preview) + display_width(&suffix);
-    let pad = row_width.saturating_sub(used);
+    // 第 1 级：完整形态，正文、序号、字数都在
+    if row_width >= prefix_width + MIN_PREVIEW_WIDTH + MIN_GAP + count_width {
+        let budget = (row_width - prefix_width - MIN_GAP - count_width).min(MAX_PREVIEW_WIDTH);
+        let preview = truncate_to_width(text, budget);
+        let pad = row_width - prefix_width - display_width(&preview) - count_width;
+        return (prefix, preview, pad, count);
+    }
 
-    (prefix, preview, pad, suffix)
+    // 第 2 级：放弃字数统计，保住正文
+    if row_width >= prefix_width + MIN_PREVIEW_WIDTH {
+        let budget = (row_width - prefix_width).min(MAX_PREVIEW_WIDTH);
+        let preview = truncate_to_width(text, budget);
+        let pad = row_width - prefix_width - display_width(&preview);
+        return (prefix, preview, pad, String::new());
+    }
+
+    // 第 3 级：极端窄，只留正文
+    let preview = truncate_to_width(text, row_width.min(MAX_PREVIEW_WIDTH));
+    let pad = row_width - display_width(&preview);
+    (String::new(), preview, pad, String::new())
 }
 
 #[cfg(test)]
@@ -230,21 +261,21 @@ mod tests {
 
     #[test]
     fn short_text_is_left_untouched() {
-        assert_eq!(truncate_preview("hello", 40), "hello");
-        assert_eq!(truncate_preview("", 40), "");
+        assert_eq!(truncate_to_width("hello", 40), "hello");
+        assert_eq!(truncate_to_width("", 40), "");
     }
 
     #[test]
     fn exact_fit_is_not_treated_as_overflow() {
         let text = "a".repeat(40);
-        let result = truncate_preview(&text, 40);
+        let result = truncate_to_width(&text, 40);
         assert_eq!(result, text);
         assert!(!result.ends_with("..."), "恰好等宽不应补省略号");
     }
 
     #[test]
     fn long_ascii_text_is_truncated_with_ellipsis() {
-        let result = truncate_preview(&"x".repeat(100), 10);
+        let result = truncate_to_width(&"x".repeat(100), 10);
         assert_eq!(result, "xxxxxxx...");
         assert_eq!(display_width(&result), 10);
     }
@@ -252,7 +283,7 @@ mod tests {
     #[test]
     fn long_cjk_text_is_truncated_on_character_boundary() {
         let text = "中文".repeat(30);
-        let result = truncate_preview(&text, 10);
+        let result = truncate_to_width(&text, 10);
 
         assert!(result.ends_with("..."));
         assert!(display_width(&result) <= 10, "不能超出预算宽度");
@@ -262,23 +293,23 @@ mod tests {
     #[test]
     fn truncation_never_splits_a_wide_character() {
         // 预算 7 列：2+2+2=6 可放 3 个汉字，第 4 个会超
-        let result = truncate_preview(&"漢".repeat(20), 10);
+        let result = truncate_to_width(&"漢".repeat(20), 10);
         assert_eq!(result, "漢漢漢...");
         assert_eq!(display_width(&result), 9);
     }
 
     #[test]
     fn newlines_and_tabs_are_folded() {
-        assert_eq!(truncate_preview("line1\nline2", 40), "line1⏎line2");
-        assert_eq!(truncate_preview("a\tb", 40), "a b");
-        assert_eq!(truncate_preview("a\r\nb", 40), "a⏎b");
+        assert_eq!(truncate_to_width("line1\nline2", 40), "line1⏎line2");
+        assert_eq!(truncate_to_width("a\tb", 40), "a b");
+        assert_eq!(truncate_to_width("a\r\nb", 40), "a⏎b");
     }
 
     #[test]
     fn tiny_budget_degrades_to_dots_without_panicking() {
-        assert_eq!(truncate_preview("hello", 0), "");
-        assert_eq!(truncate_preview("hello", 3), "...");
-        assert_eq!(truncate_preview("hello", 1), ".");
+        assert_eq!(truncate_to_width("hello", 0), "");
+        assert_eq!(truncate_to_width("hello", 3), "...");
+        assert_eq!(truncate_to_width("hello", 1), ".");
     }
 
     #[test]
@@ -314,5 +345,186 @@ mod tests {
     fn row_prefix_is_right_aligned_for_double_digits() {
         assert_eq!(row_parts(99, "a", 40).0, "100 ");
         assert_eq!(row_parts(0, "a", 40).0, "  1 ");
+    }
+
+    // --- 回归：窄宽度下「正文被右侧字数统计挤掉」---
+
+    #[test]
+    fn narrow_row_keeps_text_instead_of_dropping_it_for_the_count() {
+        let (_, preview, _, _) = row_parts(0, "Review this pull request", 12);
+        assert!(
+            !preview.is_empty(),
+            "宽度不足时正文被字数统计挤空了，行里只剩下序号和 (N 字)"
+        );
+    }
+
+    #[test]
+    fn count_is_abandoned_before_the_text_when_space_is_tight() {
+        let (_, preview, _, suffix) = row_parts(0, "Review this pull request", 12);
+        assert_eq!(suffix, "", "空间不足时应先放弃字数统计，而不是放弃正文");
+        assert!(!preview.is_empty());
+    }
+
+    #[test]
+    fn count_is_kept_when_there_is_enough_room() {
+        let long = "Review this pull request carefully and then merge it";
+        let (prefix, preview, pad, suffix) = row_parts(0, long, 46);
+        assert!(suffix.starts_with('(') && suffix.ends_with(" 字)"), "实际 {suffix:?}");
+        assert!(preview.ends_with("..."));
+        let total = display_width(&prefix) + display_width(&preview) + pad + display_width(&suffix);
+        assert_eq!(total, 46);
+    }
+
+    /// ratatui 会直接从右侧裁掉超宽内容（不会自己补省略号），
+    /// 所以拼出来的行一旦超过可用宽度，行尾的字数统计就会静默消失。
+    #[test]
+    fn composed_row_never_exceeds_available_width() {
+        let samples = [
+            "Review this pull request",
+            "今天下午的会议纪要：讨论了三个方案，最终决定先做交互原型",
+            "https://example.com/a/very/long/path?q=1&x=2",
+            "短",
+            "",
+        ];
+        for width in 0..80usize {
+            for text in samples {
+                let (prefix, preview, pad, suffix) = row_parts(3, text, width);
+                let total =
+                    display_width(&prefix) + display_width(&preview) + pad + display_width(&suffix);
+                assert!(
+                    total <= width,
+                    "width={width} text={text:?} 拼出 {total} 列，超出部分会被 ratatui 裁掉"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extremely_narrow_rows_degrade_gracefully() {
+        for width in 0..=8usize {
+            let (prefix, preview, pad, suffix) = row_parts(0, "Review", width);
+            let total = display_width(&prefix) + display_width(&preview) + pad + display_width(&suffix);
+            assert!(total <= width, "width={width} 溢出到 {total} 列");
+        }
+    }
+}
+
+/// 缓冲区级回归测试：直接量 ratatui 真正写进 `Buffer` 的内容。
+///
+/// 宽度算错、行被静默裁掉、边框被覆盖，都会在这里暴露，不需要靠肉眼盯终端。
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::app::App;
+    use crate::history::History;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// 渲染一帧并按行取回可见文本。
+    fn render_lines(app: &App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| {
+                        buffer
+                            .cell((x, y))
+                            .map(|cell| cell.symbol().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 布局：0=标题，1..=5=带边框的列表，2/3/4=三条记录，6=快捷键，7=状态。
+    const FIRST_ITEM_ROW: usize = 2;
+
+    fn demo() -> App {
+        App::new(
+            History::from_texts(vec![
+                "Review this pull request carefully".to_string(),
+                "今天下午的会议纪要：讨论了三个方案，最终决定先做交互原型，下周再评估数据层".to_string(),
+                "https://example.com/a/very/long/url/that/keeps/going?q=1".to_string(),
+            ]),
+            None,
+        )
+    }
+
+    /// 调试入口：`cargo test dump_render_evidence -- --nocapture`
+    #[test]
+    fn dump_render_evidence() {
+        for width in [70u16, 50, 34, 24, 16, 12] {
+            eprintln!("======== width={width} ========");
+            for row in render_lines(&demo(), width, 8) {
+                eprintln!("|{row}|");
+            }
+        }
+    }
+
+    /// 回归：正文开头的字符必须完整显示，不能被任何东西盖掉。
+    #[test]
+    fn item_row_never_loses_its_leading_characters() {
+        for width in [70u16, 50, 34, 24] {
+            let rows = render_lines(&demo(), width, 8);
+            let row = &rows[FIRST_ITEM_ROW];
+            assert!(
+                row.contains("Revi"),
+                "width={width} 时首字符丢失或被覆盖，实际行: {row:?}"
+            );
+        }
+    }
+
+    /// 回归：窄终端下曾经只剩「▸   1  (34 字 )」，正文被字数统计挤成空字符串。
+    #[test]
+    fn narrow_terminal_still_shows_text_instead_of_only_the_count() {
+        for width in [16u16, 18, 20, 22] {
+            let rows = render_lines(&demo(), width, 8);
+            let row = &rows[FIRST_ITEM_ROW];
+            assert!(
+                row.contains('R'),
+                "width={width} 时正文消失了，实际行: {row:?}"
+            );
+        }
+    }
+
+    /// 空间充足时，字数统计要保留并贴齐右边框。
+    ///
+    /// 两处偷不得懒：
+    /// - 不能用 `&row[1..len-1]` 按字节切片，`│` 占 3 字节，会直接 panic；
+    /// - 宽字符在 buffer 里占两个格子，第二格是填充空格，
+    ///   所以 `字` 和 `)` 在缓冲区里并不相邻，不能直接断言 `ends_with("字)")`。
+    #[test]
+    fn count_is_kept_and_right_aligned_when_there_is_room() {
+        let rows = render_lines(&demo(), 60, 8);
+        let row = &rows[FIRST_ITEM_ROW];
+
+        assert!(row.starts_with('│') && row.ends_with('│'), "边框缺失: {row:?}");
+
+        // 跳过左边框（按字符而不是字节），再去掉右边框
+        let inner: String = row.chars().skip(1).collect();
+        let inner = inner.trim_end_matches('│');
+
+        assert!(inner.contains('字'), "字数统计丢失: {row:?}");
+        assert!(
+            inner.trim_end().ends_with(')'),
+            "字数统计应贴齐右边框，实际: {row:?}"
+        );
+    }
+
+    /// CJK 行：截断点必须落在字符边界上，边框不能被写穿。
+    #[test]
+    fn cjk_row_truncates_cleanly_without_touching_borders() {
+        for width in [12u16, 16, 24, 34, 50] {
+            let rows = render_lines(&demo(), width, 8);
+            for row in &rows[FIRST_ITEM_ROW..=FIRST_ITEM_ROW + 2] {
+                assert!(row.starts_with('│'), "width={width} 左边框被覆盖: {row:?}");
+                assert!(row.ends_with('│'), "width={width} 右边框被覆盖: {row:?}");
+            }
+        }
     }
 }
