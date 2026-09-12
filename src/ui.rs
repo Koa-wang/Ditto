@@ -416,8 +416,10 @@ mod tests {
 mod render_tests {
     use super::*;
     use crate::app::App;
+    use crate::clipboard::AppEvent;
     use crate::history::History;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
     /// 渲染一帧并按行取回可见文本。
@@ -453,6 +455,158 @@ mod render_tests {
             ]),
             None,
         )
+    }
+
+    // ------------------------------------------------------------ README 截图
+    //
+    // README 里的界面截图由代码真实渲染生成，不再手写。
+    // 重新生成：cargo test dump_readme_screenshot -- --nocapture
+    // 然后把输出粘进 README.md 的 ditto-screenshot 标记之间。
+    // readme_screenshot_is_up_to_date 会校验两者一致，防止再次漂移。
+
+    const SCREENSHOT_WIDTH: u16 = 74;
+    const SCREENSHOT_HEIGHT: u16 = 8;
+    /// README 里包裹截图代码块的注释标记（GitHub 上不可见）。
+    const README_BLOCK_START: &str = "<!-- ditto-screenshot:start";
+    const README_BLOCK_END: &str = "<!-- ditto-screenshot:end";
+
+    /// 生成器输出的哨兵行，供脚本精确提取。
+    const DUMP_BEGIN: &str = "<<<DITTO-SCREENSHOT-BEGIN";
+    const DUMP_END: &str = "<<<DITTO-SCREENSHOT-END";
+
+    fn screenshot_app() -> App {
+        let entries = [
+            "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' https://api.example.com/v1/items",
+            "今天下午的会议纪要：讨论了三个方案，最终决定先做交互原型，下周再评估数据层",
+            "https://example.com/a/very/long/path/that/keeps/going/and/going?q=1",
+        ];
+        let mut app = App::new(
+            History::from_texts(entries.iter().map(|s| s.to_string())),
+            None,
+        );
+        // 让状态栏显示真实内容。写回的正是已经在顶部的那条，所以不会打乱顺序。
+        app.on_event(AppEvent::WriteDone {
+            text: entries[0].to_string(),
+            result: Ok(()),
+        });
+        app
+    }
+
+    /// 把 buffer 的一行还原成可直接粘进 README 的文本。
+    ///
+    /// 宽字符在 buffer 里会额外占用后面的格子，而那些格子被 `Cell::reset()` 复位成了
+    /// 普通空格（`skip` / `diff_option` 是 `Buffer::diff` 阶段才设置的，这里看不到）。
+    /// 所以文本表示必须**正向重建**：输出一个字符后，按它的显示宽度跳过它占的格子。
+    /// 否则粘进 README 后每个汉字都会被多算一列，整张图就歪了。
+    fn line_text(buffer: &Buffer, y: u16) -> String {
+        let mut x = 0;
+        let mut line = String::new();
+        while x < SCREENSHOT_WIDTH {
+            match buffer.cell((x, y)) {
+                Some(cell) => {
+                    let symbol = cell.symbol();
+                    line.push_str(symbol);
+                    x += display_width(symbol).max(1) as u16;
+                }
+                None => x += 1,
+            }
+        }
+        line.trim_end().to_string()
+    }
+
+    /// 渲染成可直接粘进 README 的文本。
+    fn screenshot_lines() -> Vec<String> {
+        let app = screenshot_app();
+        let backend = TestBackend::new(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..SCREENSHOT_HEIGHT)
+            .map(|y| line_text(&buffer, y))
+            .collect()
+    }
+
+    /// 调试入口：`cargo test dump_readme_screenshot -- --nocapture`
+    ///
+    /// 输出用哨兵行包起来，便于脚本精确提取（不要把 cargo 自己的输出也捎带进去）。
+    #[test]
+    fn dump_readme_screenshot() {
+        println!("{DUMP_BEGIN}");
+        for line in screenshot_lines() {
+            println!("{line}");
+        }
+        println!("{DUMP_END}");
+    }
+
+    /// 截图每行的显示宽度不得超过声明的终端宽度。
+    ///
+    /// 这条断言防的是**重建逻辑本身**出错：如果忘了跳过宽字符的占位格，
+    /// 行宽会比实际多出「汉字个数」列，粘进 README 后右边的边框就错位了——
+    /// 而防漂移测试只比对自己生成的结果，发现不了这个问题。
+    #[test]
+    fn screenshot_lines_fit_the_declared_width() {
+        let lines = screenshot_lines();
+        assert_eq!(lines.len(), SCREENSHOT_HEIGHT as usize);
+
+        for line in &lines {
+            assert!(
+                display_width(line) <= SCREENSHOT_WIDTH as usize,
+                "行宽 {} 列，超过 {} 列: {line:?}",
+                display_width(line),
+                SCREENSHOT_WIDTH
+            );
+        }
+
+        // 盒子一共 5 行：上边框（┌）、3 条记录（│）、下边框（└）。
+        // 注意上下边框不是以 │ 开头的，别按 │ 过滤。
+        let box_lines: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with(['┌', '│', '└']))
+            .collect();
+        assert_eq!(box_lines.len(), 5, "盒子应有 5 行，实际: {box_lines:#?}");
+
+        for line in box_lines {
+            assert_eq!(
+                display_width(line),
+                SCREENSHOT_WIDTH as usize,
+                "盒子行没顶满，右边框会错位: {line:?}"
+            );
+            assert!(line.ends_with(['┐', '│', '┘']), "右端不是边框字符: {line:?}");
+        }
+    }
+
+    /// 取出 README 里 ditto-screenshot 标记之间的内容。
+    fn readme_screenshot_block() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&path).expect("读取 README.md 失败");
+
+        let mut inside = false;
+        let mut lines = Vec::new();
+        for line in readme.lines() {
+            if line.contains(README_BLOCK_START) {
+                inside = true;
+                continue;
+            }
+            if line.contains(README_BLOCK_END) {
+                break;
+            }
+            // 跳过 ``` 围栏本身
+            if inside && !line.trim_start().starts_with("```") {
+                lines.push(line.trim_end().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// 防漂移：README 的截图必须与实际渲染逐行一致。
+    #[test]
+    fn readme_screenshot_is_up_to_date() {
+        assert_eq!(
+            readme_screenshot_block(),
+            screenshot_lines().join("\n"),
+            "\nREADME 的界面截图与实际渲染不一致。\n重新生成：cargo test dump_readme_screenshot -- --nocapture\n"
+        );
     }
 
     /// 调试入口：`cargo test dump_render_evidence -- --nocapture`
