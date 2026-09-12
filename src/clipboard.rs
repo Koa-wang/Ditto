@@ -1,72 +1,75 @@
-//! 后台剪贴板监听线程与线程间协议。
+//! 后台剪贴板轮询线程：读剪贴板 → 写 SQLite → 用 `cb_sink` 通知 UI 刷新。
 //!
-//! 单一所有权原则：`arboard::Clipboard` **只由监听线程持有**，主线程从不直接
-//! 调用剪贴板 API，写回也走 `MonitorCmd::Write` 命令。
+//! # `cb_sink` 是怎么被唤醒的（读源码实测，cursive 文档那句话极具误导性）
 //!
-//! 这样做有两个好处：
-//! 1. 写回与轮询共用同一个 `last_seen`，天然消除「自己写回的内容又被当成外部
-//!    新复制」的竞态；
-//! 2. 避免 Linux/X11 下双实例争抢剪贴板所有权（X11 需要进程存活以应答粘贴请求，
-//!    所以实例必须活到程序结束，不能每次轮询临时创建一个）。
+//! cursive 文档只说 *"Callbacks will be executed in the order of arrival on the
+//! next event cycle."* —— 看起来像是"得等下一次用户输入才会执行"。实测 cursive
+//! 0.21.1 / cursive_core 0.4.7 的真实机制是：
+//!
+//! 1. `CbSink` 就是 `crossbeam_channel::unbounded()` 的 Sender，`send` 永不阻塞
+//!    （`cursive_root.rs:75,90`）。
+//! 2. 事件循环每轮调用 `process_callback()`，它用 `try_recv()` 在 `while` 里
+//!    一次性排空所有待处理回调（`cursive_root.rs:831-839`）。
+//! 3. 循环**不是**阻塞在 read 上：crossterm 后端的 `poll_event()` 是
+//!    `poll(1ms)`，空闲时返回 `None`（`backends/crossterm.rs:335`）；
+//!    空闲时 `post_events` 只 `sleep(30ms)` 就进入下一轮（`cursive_run.rs:176`）。
+//! 4. 处理过回调的那一帧 `boring = false`，于是 `post_events` 直接走
+//!    `refresh()` 分支（`cursive_run.rs:151-168`）。
+//!
+//! **结论：即便 `fps = 0`（默认值就是 0），循环本身也在 ~33Hz 空转，后台线程
+//! 发出的刷新请求约 30ms 内就会被执行并重绘，不需要 `set_fps`。**
+//! `fps` 只决定"没有事件时要不要定时重绘"（时钟/动画那类需求）。
+//!
+//! # 写回剪贴板为什么不在 UI 线程直接做
+//!
+//! 保持单一所有权：`arboard::Clipboard` **只由本线程持有**。UI 线程按 Enter 时
+//! 发 `Cmd::Write` 过来，由本线程写回并同步 `last_seen`。这样"自己写回的内容"
+//! 不会被下一轮轮询当成"外部新复制"；也避免 Linux/X11 下双实例争抢剪贴板
+//! 所有权（X11 需要进程存活才能应答粘贴请求，实例必须活到程序结束）。
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use cursive::CbSink;
+
+use crate::db::Db;
 use crate::filter;
 
 /// 剪贴板轮询间隔。
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 监听线程 → 主线程。
-#[derive(Debug)]
-pub enum AppEvent {
-    /// 外部新复制的文本，已通过空文本与敏感内容过滤。
-    ClipboardChanged(String),
-    /// 命中了敏感规则，携带规则名，仅用于状态栏提示。
-    Filtered(&'static str),
-    /// 写回剪贴板的结果。携带原文，便于主线程在成功后把它提升到顶部。
-    WriteDone { text: String, result: Result<(), String> },
-    /// 剪贴板不可用（初始化失败），只发送一次。
-    MonitorError(String),
-}
-
 /// 主线程 → 监听线程。
 #[derive(Debug)]
-pub enum MonitorCmd {
+pub enum Cmd {
     Write(String),
     /// 立即退出，避免 join 时干等一个 500ms 超时。
     Shutdown,
 }
 
 pub struct Monitor {
+    cmd_tx: Sender<Cmd>,
     handle: JoinHandle<()>,
-    cmd_tx: Sender<MonitorCmd>,
-    /// 主线程用 `try_recv` 非阻塞排空，因此剪贴板更新永远不会卡住按键读取。
-    pub events: Receiver<AppEvent>,
 }
 
 impl Monitor {
-    pub fn spawn() -> Self {
+    pub fn spawn(db: Arc<Mutex<Db>>, sink: CbSink) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
-        let handle = thread::spawn(move || run(cmd_rx, event_tx));
-
-        Self {
-            handle,
-            cmd_tx,
-            events: event_rx,
-        }
+        let handle = thread::spawn(move || run(db, sink, cmd_rx));
+        Self { cmd_tx, handle }
     }
 
-    /// 请求写回剪贴板。返回 false 表示监听线程已退出（剪贴板不可用）。
-    pub fn write(&self, text: String) -> bool {
-        self.cmd_tx.send(MonitorCmd::Write(text)).is_ok()
+    /// 供 UI 回调投递命令用的发送端副本。
+    ///
+    /// 只暴露 `self.cmd_tx` 而不另写一个 `write` 包装：UI 回调拿到的是从
+    /// `user_data` 里借出来的共享状态，直接 `send` 比再绕一层更清楚。
+    pub fn sender(&self) -> Sender<Cmd> {
+        self.cmd_tx.clone()
     }
 
-    /// 通知退出并等待线程结束，保证没有悬挂线程。
     pub fn shutdown(self) {
-        let _ = self.cmd_tx.send(MonitorCmd::Shutdown);
+        let _ = self.cmd_tx.send(Cmd::Shutdown);
         let _ = self.handle.join();
     }
 }
@@ -74,19 +77,15 @@ impl Monitor {
 /// 一次轮询的处置结果。
 #[derive(Debug, PartialEq, Eq)]
 enum Reaction {
-    /// 没变化或空文本：不上报。
     Skip,
     Changed,
     Filtered(&'static str),
 }
 
-/// 决定这次读到的剪贴板内容该怎么处理，并同步 `last_seen`。
+/// 决定这次读到的内容怎么处理，并同步 `last_seen`。
 ///
-/// 抽成纯函数是为了能测到最关键的顺序问题：**刷新 `last_seen` 必须发生在过滤
+/// 抽成纯函数是为了能测住最关键的顺序问题：**刷新 `last_seen` 必须发生在过滤
 /// 判断之前**，否则同一段敏感文本会在剪贴板里躺多久、状态栏就每 500ms 弹一次。
-///
-/// 只借用 `text` 而不拿走所有权：上报时由调用方直接移动原字符串，避免为了
-/// 同时用于比较和发送而复制一份大文本。
 fn react(last_seen: &mut Option<String>, text: &str) -> Reaction {
     if last_seen.as_deref() == Some(text) {
         return Reaction::Skip;
@@ -99,7 +98,7 @@ fn react(last_seen: &mut Option<String>, text: &str) -> Reaction {
         filter::is_sensitive(text)
     };
 
-    // 先刷新 last_seen，再决定上报什么。
+    // 先刷新 last_seen，再决定做什么。
     *last_seen = Some(text.to_owned());
 
     match (is_blank, rule) {
@@ -109,14 +108,14 @@ fn react(last_seen: &mut Option<String>, text: &str) -> Reaction {
     }
 }
 
-fn run(cmd_rx: Receiver<MonitorCmd>, event_tx: Sender<AppEvent>) {
+fn run(db: Arc<Mutex<Db>>, sink: CbSink, cmd_rx: Receiver<Cmd>) {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(clipboard) => clipboard,
         Err(e) => {
-            let _ = event_tx.send(AppEvent::MonitorError(format!("剪贴板不可用: {e}")));
+            notify_status(&sink, format!("剪贴板不可用: {e}"));
             // 仍然保持响应，直到主线程要求退出。
             while let Ok(cmd) = cmd_rx.recv() {
-                if matches!(cmd, MonitorCmd::Shutdown) {
+                if matches!(cmd, Cmd::Shutdown) {
                     return;
                 }
             }
@@ -127,20 +126,17 @@ fn run(cmd_rx: Receiver<MonitorCmd>, event_tx: Sender<AppEvent>) {
     let mut last_seen: Option<String> = None;
 
     loop {
-        // recv_timeout 兼作「命令处理」与「轮询节拍」：等待期间到达的写回请求会
-        // 立即执行，不必等满 500ms，也不会被打断睡眠。
+        // recv_timeout 兼作「命令处理」与「轮询节拍」：等待期间到达的写回请求
+        // 会立即执行，不必等满 500ms。
         match cmd_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(MonitorCmd::Write(text)) => {
-                let result = clipboard.set_text(text.clone());
-                if result.is_ok() {
-                    last_seen = Some(text.clone());
+            Ok(Cmd::Write(text)) => {
+                if clipboard.set_text(text.clone()).is_ok() {
+                    last_seen = Some(text);
+                } else {
+                    notify_status(&sink, "✗ 写回剪贴板失败".to_string());
                 }
-                let _ = event_tx.send(AppEvent::WriteDone {
-                    text,
-                    result: result.map_err(|e| e.to_string()),
-                });
             }
-            Ok(MonitorCmd::Shutdown) => return,
+            Ok(Cmd::Shutdown) => return,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -150,16 +146,36 @@ fn run(cmd_rx: Receiver<MonitorCmd>, event_tx: Sender<AppEvent>) {
         if let Ok(text) = clipboard.get_text() {
             match react(&mut last_seen, &text) {
                 Reaction::Skip => {}
-                // 移动而不是 clone：text 在这里用完即弃。
-                Reaction::Changed => {
-                    let _ = event_tx.send(AppEvent::ClipboardChanged(text));
-                }
                 Reaction::Filtered(rule) => {
-                    let _ = event_tx.send(AppEvent::Filtered(rule));
+                    notify_status(&sink, format!("⚠ 已过滤疑似 {rule}，未写入历史"));
                 }
+                Reaction::Changed => match store(&db, &text) {
+                    Ok(()) => {
+                        // 通知 UI 重新查库并重绘。见文件头：不需要 set_fps。
+                        let _ = sink.send(Box::new(crate::refresh_list));
+                    }
+                    Err(e) => notify_status(&sink, format!("✗ {e}")),
+                },
             }
         }
     }
+}
+
+/// 写库 + 裁剪。返回前一定释放锁。
+///
+/// 锁的作用域被刻意限制在这次调用内：**持锁期间绝不调用 cursive**，
+/// 否则会形成「UI 线程持 DB 锁 → 触发回调 → 回调里再要 DB 锁」的自锁路径。
+fn store(db: &Arc<Mutex<Db>>, text: &str) -> Result<(), String> {
+    // 锁中毒（别的线程持锁时 panic）不该让轮询线程直接死掉：
+    // SQLite 自身有事务保证，锁里的数据仍然是可用的，取回内层值继续用。
+    let guard = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.upsert(text)?;
+    guard.prune()?;
+    Ok(())
+}
+
+fn notify_status(sink: &CbSink, message: String) {
+    let _ = sink.send(Box::new(move |siv| crate::set_status(siv, &message)));
 }
 
 #[cfg(test)]
@@ -204,7 +220,7 @@ mod tests {
         assert_eq!(last_seen.as_deref(), Some(token.as_str()));
     }
 
-    /// 回归测试：敏感文本必须只提示一次，而不是每 500ms 弹一次。
+    /// 回归：敏感文本只提示一次，而不是每 500ms 弹一次。
     #[test]
     fn sensitive_content_only_notifies_once() {
         let mut last_seen = None;
@@ -218,12 +234,20 @@ mod tests {
     }
 
     #[test]
-    fn write_result_marks_content_as_seen() {
-        // 模拟监听线程里 Write 成功后的处理：last_seen 被刷新，
-        // 于是紧接着的轮询不会把自己写回的内容当成外部新复制。
+    fn write_back_marks_content_as_seen() {
+        // 模拟写回成功后 last_seen 被刷新：紧接着的轮询不会把自己写回的内容
+        // 当成外部新复制。
         let written = "from-the-app".to_string();
         let mut last_seen = Some(written.clone());
-
         assert_eq!(react(&mut last_seen, &written), Reaction::Skip);
+    }
+
+    #[test]
+    fn store_writes_and_prunes() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        store(&db, "from-the-poller").unwrap();
+
+        let guard = db.lock().unwrap();
+        assert_eq!(guard.len().unwrap(), 1);
     }
 }

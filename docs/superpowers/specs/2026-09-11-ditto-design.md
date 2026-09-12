@@ -1,3 +1,8 @@
+> **已被取代（2026-09-12）**：本设计对应的 ratatui + JSON 实现已整体替换为
+> Cursive + SQLite 版（见 `2026-09-12-ditto-cursive-sqlite-design.md`）。
+> 旧代码完整保存在 tag `ratatui-final`（commit 2505f03），`git checkout ratatui-final -- src/` 可取回。
+> 本文保留作为历史记录，其中「终端安全」「行内宽度降级」「敏感过滤规则」等结论仍被新实现沿用。
+
 # Ditto — 终端剪贴板历史管理器 设计文档
 
 - 日期：2026-09-11

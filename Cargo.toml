@@ -2,7 +2,7 @@
 name = "ditto"
 version = "0.1.0"
 edition = "2021"
-description = "终端剪贴板历史管理器（Ratatui TUI）"
+description = "终端剪贴板历史管理器（Cursive TUI + SQLite）"
 
 # 二进制名刻意不叫 ditto：macOS 自带 /usr/bin/ditto（文件拷贝工具）。
 # 装成 ditto 会二选一出问题——要么被系统命令挡在前面（敲 ditto 实际跑的是系统工具），
@@ -14,12 +14,23 @@ path = "src/main.rs"
 
 [dependencies]
 arboard = "3.6.1"
-crossterm = "0.29.0"
+# crossterm-backend 是 cursive 的默认 feature（ncurses-backend 默认关闭），
+# 所以这里不需要 default-features = false，也不需要系统装 ncurses。
+cursive = "0.21.1"
+# 只为了 panic hook 里的终端恢复（disable_raw_mode / LeaveAlternateScreen）。
+# 版本必须和 cursive 的 crossterm 后端一致，否则会编出两份 crossterm：
+# cursive 0.21.1 依赖 crossterm 0.28.1。用 `cargo tree -d` 可以核对。
+crossterm = "0.28.1"
 dirs = "7.0.0"
-ratatui = "0.30.2"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# bundled：把 sqlite3 的 C 源码一起编进去，用户端不需要装 sqlite3 开发库。
+# 代价是编译变慢（实测 release 会多花十几秒）。
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 unicode-width = "0.2.2"
+
+# Linux 原生 Wayland 剪贴板。此前 README 声称支持、但依赖里其实没接上，这次补齐。
+# 不设这个 feature 时 arboard 在 Wayland 下只能退回 XWayland。
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 tempfile = "3"
